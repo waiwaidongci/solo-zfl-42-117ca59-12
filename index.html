@@ -261,6 +261,51 @@
       } catch (err) { /* 本地数据损坏时保留内存状态 */ }
     }
 
+    /* 跨标签互斥：同步快照、校验、生效在同一个临界区内完成。
+       两个标签页是独立进程，仅靠"先读再写"仍会在检查与生效之间交错，
+       因此用 Web Locks（无则回退 localStorage 令牌锁）保证同一时刻只有一方进入，
+       结果不受调度顺序影响。 */
+    const storeLockKey = "zfl42StoreLock";
+
+    async function withFallbackLock(fn) {
+      const token = crypto.randomUUID();
+      const deadline = Date.now() + 10000;
+      for (;;) {
+        let cur = null;
+        try { cur = JSON.parse(localStorage.getItem(storeLockKey) || "null"); } catch (err) { cur = null; }
+        if (!cur || cur.t < Date.now() - 5000) {
+          localStorage.setItem(storeLockKey, JSON.stringify({ token, t: Date.now() }));
+          try {
+            const verify = JSON.parse(localStorage.getItem(storeLockKey) || "null");
+            if (verify && verify.token === token) break;
+          } catch (err) { /* 继续重试 */ }
+        }
+        if (Date.now() > deadline) break; // 超时兜底，避免死锁
+        await new Promise(r => setTimeout(r, 15 + Math.random() * 25));
+      }
+      try {
+        return await fn();
+      } finally {
+        try {
+          const cur = JSON.parse(localStorage.getItem(storeLockKey) || "null");
+          if (cur && cur.token === token) localStorage.removeItem(storeLockKey);
+        } catch (err) { /* 忽略 */ }
+      }
+    }
+
+    // mutator 返回错误字符串（校验失败，零写入），或返回提交函数（校验通过后的生效动作）
+    function runMutation(mutator) {
+      const exec = async () => {
+        syncFromStorage();
+        const outcome = mutator();
+        if (typeof outcome !== "function") return outcome;
+        if (window.__loanTestDelay) await new Promise(r => setTimeout(r, window.__loanTestDelay));
+        return outcome();
+      };
+      if (navigator.locks && navigator.locks.request) return navigator.locks.request("zfl42-store", exec);
+      return withFallbackLock(exec);
+    }
+
     function now() {
       return new Date().toLocaleString();
     }
@@ -291,45 +336,49 @@
       w.logs.push(text);
     }
 
-    /* ---------- 借展状态机：所有动作返回错误字符串，null 表示成功；失败时零变更 ---------- */
+    /* ---------- 借展状态机：校验在临界区内完成，返回错误字符串则零写入；
+       校验通过返回提交函数，仍在同一临界区内生效 ---------- */
 
     function createLoan(data, workIds) {
-      syncFromStorage();
-      const roles = [data.applicant, data.approver, data.carrier, data.inspector].map(s => (s || "").trim());
-      if (!(data.borrower || "").trim() || !(data.purpose || "").trim()) return "请填写借展单位与用途";
-      if (!workIds.length) return "请至少选择一件作品";
-      if (roles.some(r => !r)) return "请填写申请人、审批人、承运人、验收人";
-      if (new Set(roles).size !== 4) return "申请人、审批人、承运人、验收人须由不同人员担任";
-      if (!data.startDate || !data.dueDate) return "请填写借出日期与应还日期";
-      if (data.dueDate < data.startDate) return "应还日期不能早于借出日期";
-      for (const wid of workIds) {
-        const w = workById(wid);
-        if (!w) return "所选作品不存在";
-        const other = openLoanOf(wid);
-        if (other) return `作品《${w.theme}》已在未结束借展单 ${other.code} 中`;
-      }
-      const loan = {
-        id: crypto.randomUUID(),
-        code: "JC-" + String(loans.length + 1).padStart(3, "0"),
-        workIds: [...workIds],
-        borrower: data.borrower.trim(),
-        purpose: data.purpose.trim(),
-        startDate: data.startDate,
-        dueDate: data.dueDate,
-        applicant: roles[0],
-        approver: roles[1],
-        carrier: roles[2],
-        inspector: roles[3],
-        status: "申请中",
-        history: [],
-        claims: [],
-        supplements: []
-      };
-      pushHistory(loan, loan.applicant, "提交借展申请");
-      loans.unshift(loan);
-      saveLoans();
-      render();
-      return null;
+      return runMutation(() => {
+        const roles = [data.applicant, data.approver, data.carrier, data.inspector].map(s => (s || "").trim());
+        if (!(data.borrower || "").trim() || !(data.purpose || "").trim()) return "请填写借展单位与用途";
+        if (!workIds.length) return "请至少选择一件作品";
+        if (roles.some(r => !r)) return "请填写申请人、审批人、承运人、验收人";
+        if (new Set(roles).size !== 4) return "申请人、审批人、承运人、验收人须由不同人员担任";
+        if (!data.startDate || !data.dueDate) return "请填写借出日期与应还日期";
+        if (data.dueDate < data.startDate) return "应还日期不能早于借出日期";
+        for (const wid of workIds) {
+          const w = workById(wid);
+          if (!w) return "所选作品不存在";
+          const other = openLoanOf(wid);
+          if (other) return `作品《${w.theme}》已在未结束借展单 ${other.code} 中`;
+        }
+        const loan = {
+          id: crypto.randomUUID(),
+          code: "JC-" + String(loans.length + 1).padStart(3, "0"),
+          workIds: [...workIds],
+          borrower: data.borrower.trim(),
+          purpose: data.purpose.trim(),
+          startDate: data.startDate,
+          dueDate: data.dueDate,
+          applicant: roles[0],
+          approver: roles[1],
+          carrier: roles[2],
+          inspector: roles[3],
+          status: "申请中",
+          history: [],
+          claims: [],
+          supplements: []
+        };
+        pushHistory(loan, loan.applicant, "提交借展申请");
+        return () => {
+          loans.unshift(loan);
+          saveLoans();
+          render();
+          return null;
+        };
+      });
     }
 
     function guard(loan, status, actor, roleKey, roleName) {
@@ -341,137 +390,162 @@
     }
 
     function approveLoan(id, actor) {
-      syncFromStorage();
-      const loan = findLoan(id);
-      const err = guard(loan, "申请中", actor, "approver", "审批人");
-      if (err) return err;
-      for (const wid of loan.workIds) {
-        const other = openLoanOf(wid, loan.id);
-        if (other) return `作品《${workById(wid).theme}》已被借展单 ${other.code} 占用`;
-      }
-      loan.status = "已批准";
-      pushHistory(loan, actor.trim(), "批准借展");
-      saveLoans();
-      render();
-      return null;
+      return runMutation(() => {
+        const loan = findLoan(id);
+        const err = guard(loan, "申请中", actor, "approver", "审批人");
+        if (err) return err;
+        for (const wid of loan.workIds) {
+          const other = openLoanOf(wid, loan.id);
+          if (other) return `作品《${workById(wid).theme}》已被借展单 ${other.code} 占用`;
+        }
+        return () => {
+          loan.status = "已批准";
+          pushHistory(loan, actor.trim(), "批准借展");
+          saveLoans();
+          render();
+          return null;
+        };
+      });
     }
 
     function rejectLoan(id, actor, reason) {
-      syncFromStorage();
-      const loan = findLoan(id);
-      const err = guard(loan, "申请中", actor, "approver", "审批人");
-      if (err) return err;
-      if (!(reason || "").trim()) return "驳回须填写原因";
-      loan.status = "已驳回";
-      pushHistory(loan, actor.trim(), "驳回申请", reason.trim());
-      saveLoans();
-      render();
-      return null;
+      return runMutation(() => {
+        const loan = findLoan(id);
+        const err = guard(loan, "申请中", actor, "approver", "审批人");
+        if (err) return err;
+        if (!(reason || "").trim()) return "驳回须填写原因";
+        const text = reason.trim();
+        return () => {
+          loan.status = "已驳回";
+          pushHistory(loan, actor.trim(), "驳回申请", text);
+          saveLoans();
+          render();
+          return null;
+        };
+      });
     }
 
     function withdrawLoan(id, actor, reason) {
-      syncFromStorage();
-      const loan = findLoan(id);
-      if (!loan) return "借展单不存在";
-      if (TERMINAL_LOAN.includes(loan.status)) return `借展单${loan.status}，原记录只读`;
-      if (!["申请中", "已批准"].includes(loan.status)) return `当前状态为「${loan.status}」，无法撤回`;
-      if ((actor || "").trim() !== loan.applicant) return `此操作须由申请人 ${loan.applicant} 本人执行`;
-      if (!(reason || "").trim()) return "撤回须填写原因";
-      loan.status = "已撤回";
-      pushHistory(loan, actor.trim(), "撤回申请", reason.trim());
-      saveLoans();
-      render();
-      return null;
+      return runMutation(() => {
+        const loan = findLoan(id);
+        if (!loan) return "借展单不存在";
+        if (TERMINAL_LOAN.includes(loan.status)) return `借展单${loan.status}，原记录只读`;
+        if (!["申请中", "已批准"].includes(loan.status)) return `当前状态为「${loan.status}」，无法撤回`;
+        if ((actor || "").trim() !== loan.applicant) return `此操作须由申请人 ${loan.applicant} 本人执行`;
+        if (!(reason || "").trim()) return "撤回须填写原因";
+        const text = reason.trim();
+        return () => {
+          loan.status = "已撤回";
+          pushHistory(loan, actor.trim(), "撤回申请", text);
+          saveLoans();
+          render();
+          return null;
+        };
+      });
     }
 
     // 出库：任一作品不符条件则整批不放行，不产生部分变更
     function checkoutLoan(id, actor) {
-      syncFromStorage();
-      const loan = findLoan(id);
-      const err = guard(loan, "已批准", actor, "carrier", "承运人");
-      if (err) return err;
-      const problems = [];
-      for (const wid of loan.workIds) {
-        const w = workById(wid);
-        if (!w) { problems.push("存在已被删除的作品"); continue; }
-        const other = openLoanOf(wid, loan.id);
-        if (other) problems.push(`《${w.theme}》已被借展单 ${other.code} 占用`);
-        if (w.status !== "待交付") problems.push(`《${w.theme}》当前状态为「${w.status}」，须为「待交付」方可出库`);
-        if (w.defect) problems.push(`《${w.theme}》存在未处理缺陷：${w.defect}`);
-      }
-      if (problems.length) return "整批未放行，未产生任何变更：\n" + problems.join("\n");
-      loan.status = "已出库";
-      pushHistory(loan, actor.trim(), "整批出库");
-      loan.workIds.forEach(wid => workLog(workById(wid), `${now()} 借展出库（${loan.code}）`));
-      saveAll();
-      render();
-      return null;
+      return runMutation(() => {
+        const loan = findLoan(id);
+        const err = guard(loan, "已批准", actor, "carrier", "承运人");
+        if (err) return err;
+        const problems = [];
+        for (const wid of loan.workIds) {
+          const w = workById(wid);
+          if (!w) { problems.push("存在已被删除的作品"); continue; }
+          const other = openLoanOf(wid, loan.id);
+          if (other) problems.push(`《${w.theme}》已被借展单 ${other.code} 占用`);
+          if (w.status !== "待交付") problems.push(`《${w.theme}》当前状态为「${w.status}」，须为「待交付」方可出库`);
+          if (w.defect) problems.push(`《${w.theme}》存在未处理缺陷：${w.defect}`);
+        }
+        if (problems.length) return "整批未放行，未产生任何变更：\n" + problems.join("\n");
+        return () => {
+          loan.status = "已出库";
+          pushHistory(loan, actor.trim(), "整批出库");
+          loan.workIds.forEach(wid => workLog(workById(wid), `${now()} 借展出库（${loan.code}）`));
+          saveAll();
+          render();
+          return null;
+        };
+      });
     }
 
     // 归还：须整批确认到齐；逾期须留原因；任一不符则整批不放行
     function returnLoan(id, actor, checkedIds, overdueReason) {
-      syncFromStorage();
-      const loan = findLoan(id);
-      const err = guard(loan, "已出库", actor, "carrier", "承运人");
-      if (err) return err;
-      const missing = loan.workIds.filter(wid => !checkedIds.includes(wid));
-      if (missing.length) {
-        return "整批未放行，未产生任何变更：以下作品未确认归还：" +
-          missing.map(wid => `《${(workById(wid) || {}).theme || wid}》`).join("、");
-      }
-      if (isOverdue(loan) && !(overdueReason || "").trim()) return "该单已逾期，须填写逾期原因方可登记归还";
-      const wasOverdue = isOverdue(loan);
-      loan.status = "归还待验";
-      pushHistory(loan, actor.trim(), "整批归还，待验收", wasOverdue ? "逾期原因：" + overdueReason.trim() : "");
-      loan.workIds.forEach(wid => workLog(workById(wid), `${now()} 借展归还（${loan.code}）`));
-      saveAll();
-      render();
-      return null;
+      return runMutation(() => {
+        const loan = findLoan(id);
+        const err = guard(loan, "已出库", actor, "carrier", "承运人");
+        if (err) return err;
+        const missing = loan.workIds.filter(wid => !checkedIds.includes(wid));
+        if (missing.length) {
+          return "整批未放行，未产生任何变更：以下作品未确认归还：" +
+            missing.map(wid => `《${(workById(wid) || {}).theme || wid}》`).join("、");
+        }
+        if (isOverdue(loan) && !(overdueReason || "").trim()) return "该单已逾期，须填写逾期原因方可登记归还";
+        const wasOverdue = isOverdue(loan);
+        const reasonText = (overdueReason || "").trim();
+        return () => {
+          loan.status = "归还待验";
+          pushHistory(loan, actor.trim(), "整批归还，待验收", wasOverdue ? "逾期原因：" + reasonText : "");
+          loan.workIds.forEach(wid => workLog(workById(wid), `${now()} 借展归还（${loan.code}）`));
+          saveAll();
+          render();
+          return null;
+        };
+      });
     }
 
     // 验收关闭：损坏作品须留理赔原因，否则整批不验收
     function closeLoan(id, actor, results) {
-      syncFromStorage();
-      const loan = findLoan(id);
-      const err = guard(loan, "归还待验", actor, "inspector", "验收人");
-      if (err) return err;
-      const problems = [];
-      for (const wid of loan.workIds) {
-        const r = results[wid] || {};
-        if (r.damaged && !(r.claim || "").trim()) {
-          problems.push(`《${(workById(wid) || {}).theme || wid}》验收为损坏，须填写损坏理赔原因`);
+      return runMutation(() => {
+        const loan = findLoan(id);
+        const err = guard(loan, "归还待验", actor, "inspector", "验收人");
+        if (err) return err;
+        const problems = [];
+        const damaged = [];
+        for (const wid of loan.workIds) {
+          const r = results[wid] || {};
+          if (r.damaged && !(r.claim || "").trim()) {
+            problems.push(`《${(workById(wid) || {}).theme || wid}》验收为损坏，须填写损坏理赔原因`);
+          } else if (r.damaged) {
+            damaged.push({ wid, text: r.claim.trim() });
+          }
         }
-      }
-      if (problems.length) return "整批未验收，未产生任何变更：\n" + problems.join("\n");
-      loan.status = "已关闭";
-      for (const wid of loan.workIds) {
-        const r = results[wid] || {};
-        if (!r.damaged) continue;
-        const w = workById(wid);
-        const text = r.claim.trim();
-        loan.claims.push({ workId: wid, theme: w ? w.theme : wid, text, t: now() });
-        if (w) {
-          w.defect = w.defect ? `${w.defect}; 借展损坏：${text}` : `借展损坏：${text}`;
-          workLog(w, `${now()} 借展验收损坏（${loan.code}）：${text}`);
-        }
-      }
-      pushHistory(loan, actor.trim(), "验收通过，借展单关闭", loan.claims.length ? `损坏理赔 ${loan.claims.length} 件` : "");
-      saveAll();
-      render();
-      return null;
+        if (problems.length) return "整批未验收，未产生任何变更：\n" + problems.join("\n");
+        return () => {
+          loan.status = "已关闭";
+          for (const d of damaged) {
+            const w = workById(d.wid);
+            loan.claims.push({ workId: d.wid, theme: w ? w.theme : d.wid, text: d.text, t: now() });
+            if (w) {
+              w.defect = w.defect ? `${w.defect}; 借展损坏：${d.text}` : `借展损坏：${d.text}`;
+              workLog(w, `${now()} 借展验收损坏（${loan.code}）：${d.text}`);
+            }
+          }
+          pushHistory(loan, actor.trim(), "验收通过，借展单关闭", loan.claims.length ? `损坏理赔 ${loan.claims.length} 件` : "");
+          saveAll();
+          render();
+          return null;
+        };
+      });
     }
 
     // 关闭后原记录只读，补充说明以追加记录呈现
     function addSupplement(id, author, text) {
-      syncFromStorage();
-      const loan = findLoan(id);
-      if (!loan) return "借展单不存在";
-      if (loan.status !== "已关闭") return "仅已关闭的借展单可追加补充说明";
-      if (!(author || "").trim() || !(text || "").trim()) return "请填写说明人与补充内容";
-      loan.supplements.push({ t: now(), author: author.trim(), text: text.trim() });
-      saveLoans();
-      render();
-      return null;
+      return runMutation(() => {
+        const loan = findLoan(id);
+        if (!loan) return "借展单不存在";
+        if (loan.status !== "已关闭") return "仅已关闭的借展单可追加补充说明";
+        if (!(author || "").trim() || !(text || "").trim()) return "请填写说明人与补充内容";
+        const entry = { t: now(), author: author.trim(), text: text.trim() };
+        return () => {
+          loan.supplements.push(entry);
+          saveLoans();
+          render();
+          return null;
+        };
+      });
     }
 
     /* ---------- 作品看板 ---------- */
@@ -484,26 +558,36 @@
     }
 
     function updateStatus(id, status) {
-      syncFromStorage();
-      const work = works.find(w => w.id === id);
-      work.status = status;
-      if (status === "待阴干") work.dryDate = new Date().toISOString().slice(0, 10);
-      if (status === "上金粉") work.gold = "已上金粉";
-      if (status === "待交付") work.progress = 100;
-      workLog(work, `${now()} 更新为 ${status}`);
-      save();
-      render();
+      return runMutation(() => {
+        const work = works.find(w => w.id === id);
+        if (!work) return "作品不存在";
+        return () => {
+          work.status = status;
+          if (status === "待阴干") work.dryDate = new Date().toISOString().slice(0, 10);
+          if (status === "上金粉") work.gold = "已上金粉";
+          if (status === "待交付") work.progress = 100;
+          workLog(work, `${now()} 更新为 ${status}`);
+          save();
+          render();
+          return null;
+        };
+      });
     }
 
     function recordDefect(id, text) {
-      syncFromStorage();
-      const work = works.find(w => w.id === id);
       const value = text || prompt("输入断线/翘线位置");
       if (!value) return;
-      work.defect = work.defect ? `${work.defect}; ${value}` : value;
-      workLog(work, `${now()} 缺陷：${value}`);
-      save();
-      render();
+      return runMutation(() => {
+        const work = works.find(w => w.id === id);
+        if (!work) return "作品不存在";
+        return () => {
+          work.defect = work.defect ? `${work.defect}; ${value}` : value;
+          workLog(work, `${now()} 缺陷：${value}`);
+          save();
+          render();
+          return null;
+        };
+      });
     }
 
     function showDetail(id) {
@@ -653,8 +737,8 @@
       const q = s => box.querySelector(s);
       const actor = () => (q("#loanActor") || { value: "" }).value;
       const reason = () => (q("#loanReason") || { value: "" }).value;
-      const run = fn => {
-        const err = fn();
+      const run = async fn => {
+        const err = await fn();
         if (err) {
           document.querySelector("#loanMsg").textContent = err;
         } else {
@@ -690,36 +774,41 @@
 
     /* ---------- 事件 ---------- */
 
-    form.addEventListener("submit", event => {
+    form.addEventListener("submit", async event => {
       event.preventDefault();
-      syncFromStorage();
       const data = Object.fromEntries(new FormData(form).entries());
-      works.unshift({
-        id: crypto.randomUUID(),
-        base: data.base,
-        theme: data.theme,
-        line: data.line,
-        progress: Number(data.progress),
-        dryDate: data.dryDate,
-        gold: data.gold,
-        defect: data.defect,
-        delivery: data.delivery,
-        status: data.status,
-        note: data.note,
-        logs: [`${now()} 创建作品`]
+      await runMutation(() => {
+        const work = {
+          id: crypto.randomUUID(),
+          base: data.base,
+          theme: data.theme,
+          line: data.line,
+          progress: Number(data.progress),
+          dryDate: data.dryDate,
+          gold: data.gold,
+          defect: data.defect,
+          delivery: data.delivery,
+          status: data.status,
+          note: data.note,
+          logs: [`${now()} 创建作品`]
+        };
+        return () => {
+          works.unshift(work);
+          save();
+          render();
+          return null;
+        };
       });
       form.reset();
       form.dryDate.value = today;
       form.delivery.value = plusDays(5);
-      save();
-      render();
     });
 
-    loanForm.addEventListener("submit", event => {
+    loanForm.addEventListener("submit", async event => {
       event.preventDefault();
       const data = Object.fromEntries(new FormData(loanForm).entries());
       const ids = [...loanForm.querySelectorAll('input[name="loanWorks"]:checked')].map(c => c.value);
-      const err = createLoan(data, ids);
+      const err = await createLoan(data, ids);
       document.querySelector("#loanFormMsg").textContent = err || "";
       if (err) return;
       loanForm.reset();
@@ -797,11 +886,14 @@
       }
       try {
         const backup = validateBackup(parsed);
-        // 校验全部通过后才替换数据
-        works = backup.works;
-        loans = backup.loans;
-        saveAll();
-        render();
+        // 校验全部通过后，在临界区内替换数据（与其他页面的变更互斥）
+        await runMutation(() => () => {
+          works = backup.works;
+          loans = backup.loans;
+          saveAll();
+          render();
+          return null;
+        });
         alert(`恢复完成：作品 ${works.length} 件，借展单 ${loans.length} 张`);
       } catch (err) {
         alert(`导入失败：${err.message}。现有作品与借展记录未受影响。`);
