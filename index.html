@@ -251,6 +251,16 @@
       saveLoans();
     }
 
+    // 变更前先同步其他页面已提交的最新状态，避免旧内存覆盖别人的记录
+    function syncFromStorage() {
+      try {
+        const w = localStorage.getItem(storageKey);
+        const l = localStorage.getItem(loanKey);
+        if (w) works = JSON.parse(w);
+        if (l) loans = JSON.parse(l);
+      } catch (err) { /* 本地数据损坏时保留内存状态 */ }
+    }
+
     function now() {
       return new Date().toLocaleString();
     }
@@ -284,6 +294,7 @@
     /* ---------- 借展状态机：所有动作返回错误字符串，null 表示成功；失败时零变更 ---------- */
 
     function createLoan(data, workIds) {
+      syncFromStorage();
       const roles = [data.applicant, data.approver, data.carrier, data.inspector].map(s => (s || "").trim());
       if (!(data.borrower || "").trim() || !(data.purpose || "").trim()) return "请填写借展单位与用途";
       if (!workIds.length) return "请至少选择一件作品";
@@ -330,6 +341,7 @@
     }
 
     function approveLoan(id, actor) {
+      syncFromStorage();
       const loan = findLoan(id);
       const err = guard(loan, "申请中", actor, "approver", "审批人");
       if (err) return err;
@@ -345,6 +357,7 @@
     }
 
     function rejectLoan(id, actor, reason) {
+      syncFromStorage();
       const loan = findLoan(id);
       const err = guard(loan, "申请中", actor, "approver", "审批人");
       if (err) return err;
@@ -357,6 +370,7 @@
     }
 
     function withdrawLoan(id, actor, reason) {
+      syncFromStorage();
       const loan = findLoan(id);
       if (!loan) return "借展单不存在";
       if (TERMINAL_LOAN.includes(loan.status)) return `借展单${loan.status}，原记录只读`;
@@ -372,6 +386,7 @@
 
     // 出库：任一作品不符条件则整批不放行，不产生部分变更
     function checkoutLoan(id, actor) {
+      syncFromStorage();
       const loan = findLoan(id);
       const err = guard(loan, "已批准", actor, "carrier", "承运人");
       if (err) return err;
@@ -395,6 +410,7 @@
 
     // 归还：须整批确认到齐；逾期须留原因；任一不符则整批不放行
     function returnLoan(id, actor, checkedIds, overdueReason) {
+      syncFromStorage();
       const loan = findLoan(id);
       const err = guard(loan, "已出库", actor, "carrier", "承运人");
       if (err) return err;
@@ -415,6 +431,7 @@
 
     // 验收关闭：损坏作品须留理赔原因，否则整批不验收
     function closeLoan(id, actor, results) {
+      syncFromStorage();
       const loan = findLoan(id);
       const err = guard(loan, "归还待验", actor, "inspector", "验收人");
       if (err) return err;
@@ -446,6 +463,7 @@
 
     // 关闭后原记录只读，补充说明以追加记录呈现
     function addSupplement(id, author, text) {
+      syncFromStorage();
       const loan = findLoan(id);
       if (!loan) return "借展单不存在";
       if (loan.status !== "已关闭") return "仅已关闭的借展单可追加补充说明";
@@ -466,6 +484,7 @@
     }
 
     function updateStatus(id, status) {
+      syncFromStorage();
       const work = works.find(w => w.id === id);
       work.status = status;
       if (status === "待阴干") work.dryDate = new Date().toISOString().slice(0, 10);
@@ -477,6 +496,7 @@
     }
 
     function recordDefect(id, text) {
+      syncFromStorage();
       const work = works.find(w => w.id === id);
       const value = text || prompt("输入断线/翘线位置");
       if (!value) return;
@@ -672,6 +692,7 @@
 
     form.addEventListener("submit", event => {
       event.preventDefault();
+      syncFromStorage();
       const data = Object.fromEntries(new FormData(form).entries());
       works.unshift({
         id: crypto.randomUUID(),
@@ -729,24 +750,62 @@
       URL.revokeObjectURL(link.href);
     });
 
+    // 校验备份文件：任何字段格式不对都抛错，绝不改动现有数据
+    function validateBackup(parsed) {
+      const isLegacy = Array.isArray(parsed);
+      const w = isLegacy ? parsed : (parsed && parsed.works);
+      if (!Array.isArray(w)) throw new Error("缺少作品数组（works）");
+      w.forEach((item, i) => {
+        if (!item || typeof item !== "object" || typeof item.id !== "string" || !item.id) {
+          throw new Error(`第 ${i + 1} 件作品缺少有效的 id 字段`);
+        }
+      });
+      const l = isLegacy || parsed.loans === undefined ? [] : parsed.loans;
+      if (!Array.isArray(l)) throw new Error("借展记录（loans）字段不是数组");
+      l.forEach((loan, i) => {
+        const name = loan && typeof loan.code === "string" && loan.code ? `「${loan.code}」` : `第 ${i + 1} 张`;
+        if (!loan || typeof loan !== "object") throw new Error(`借展单${name}不是有效记录`);
+        if (typeof loan.id !== "string" || !loan.id) throw new Error(`借展单${name}缺少有效的 id`);
+        if (typeof loan.code !== "string" || !loan.code) throw new Error(`借展单${name}缺少单号（code）`);
+        if (!Array.isArray(loan.workIds) || loan.workIds.some(x => typeof x !== "string")) {
+          throw new Error(`借展单${name}的作品列表（workIds）格式不正确`);
+        }
+        if (![...OPEN_LOAN, ...TERMINAL_LOAN].includes(loan.status)) {
+          throw new Error(`借展单${name}的状态「${loan.status}」无效`);
+        }
+        ["borrower", "purpose", "startDate", "dueDate", "applicant", "approver", "carrier", "inspector"].forEach(k => {
+          if (typeof loan[k] !== "string") throw new Error(`借展单${name}缺少字段（${k}）`);
+        });
+        if (!Array.isArray(loan.history)) throw new Error(`借展单${name}的流转记录（history）格式不正确`);
+        if (!Array.isArray(loan.claims)) throw new Error(`借展单${name}的理赔记录（claims）格式不正确`);
+        if (!Array.isArray(loan.supplements)) throw new Error(`借展单${name}的补充说明（supplements）格式不正确`);
+      });
+      return { works: w, loans: l };
+    }
+
     document.querySelector("#importBtn").addEventListener("click", () => document.querySelector("#importFile").click());
     document.querySelector("#importFile").addEventListener("change", async event => {
       const file = event.target.files[0];
+      event.target.value = "";
       if (!file) return;
+      let parsed;
       try {
-        const parsed = JSON.parse(await file.text());
-        const importedWorks = Array.isArray(parsed) ? parsed : parsed.works;
-        const importedLoans = Array.isArray(parsed) ? [] : (parsed.loans || []);
-        if (!Array.isArray(importedWorks)) throw new Error("bad format");
-        works = importedWorks;
-        loans = importedLoans;
+        parsed = JSON.parse(await file.text());
+      } catch (err) {
+        alert("导入失败：文件不是有效的 JSON。现有作品与借展记录未受影响。");
+        return;
+      }
+      try {
+        const backup = validateBackup(parsed);
+        // 校验全部通过后才替换数据
+        works = backup.works;
+        loans = backup.loans;
         saveAll();
         render();
         alert(`恢复完成：作品 ${works.length} 件，借展单 ${loans.length} 张`);
       } catch (err) {
-        alert("导入失败：文件格式不正确");
+        alert(`导入失败：${err.message}。现有作品与借展记录未受影响。`);
       }
-      event.target.value = "";
     });
 
     window.updateStatus = updateStatus;
@@ -761,6 +820,15 @@
     window.returnLoan = returnLoan;
     window.closeLoan = closeLoan;
     window.addSupplement = addSupplement;
+
+    // 其他页面提交变更后，本页面同步刷新，避免展示和提交旧状态
+    window.addEventListener("storage", event => {
+      if (event.key !== storageKey && event.key !== loanKey) return;
+      syncFromStorage();
+      render();
+      if (loanDialog.open && activeLoanId) showLoan(activeLoanId);
+    });
+
     saveAll();
     render();
   </script>
