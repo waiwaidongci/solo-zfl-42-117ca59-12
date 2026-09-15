@@ -51,10 +51,26 @@
     dialog::backdrop { background: rgba(0, 0, 0, 0.3); }
     .dialog-body { padding: 16px; display: grid; gap: 10px; }
     .empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
+    .loan-grid { display: grid; grid-template-columns: 400px 1fr; gap: 18px; align-items: start; }
+    .work-picker { max-height: 190px; overflow: auto; border: 1px solid var(--line); border-radius: 6px; padding: 8px; display: grid; gap: 6px; background: #fbfdfb; }
+    .work-picker label, .retChecks label { display: flex; gap: 8px; align-items: center; font-size: 13px; color: var(--ink); }
+    .work-picker input, .retChecks input { width: auto; }
+    .work-picker label.busy span { color: var(--muted); }
+    .retChecks { display: grid; gap: 6px; }
+    .chip { display: inline-block; color: #fff; border-radius: 10px; padding: 2px 8px; font-size: 12px; }
+    .chip.s-open { background: var(--amber); }
+    .chip.s-out { background: var(--violet); }
+    .chip.s-back { background: var(--teal); }
+    .chip.s-done { background: #5d6764; }
+    .chip.s-stop { background: var(--red); }
+    .msg { color: var(--red); font-size: 13px; white-space: pre-line; }
+    .hist { font-size: 12px; color: var(--muted); line-height: 1.7; }
+    .inspect-row { display: grid; grid-template-columns: 1fr 86px 1fr; gap: 8px; align-items: center; font-size: 13px; }
+    .dialog-body h3 { margin: 6px 0 2px; font-size: 14px; }
     @media (max-width: 980px) {
       header { display: block; padding: 18px; }
       main { padding: 16px; }
-      .top, .lists, .toolbar { grid-template-columns: 1fr; }
+      .top, .lists, .toolbar, .loan-grid { grid-template-columns: 1fr; }
       .grid2 { grid-template-columns: 1fr; }
     }
   </style>
@@ -63,9 +79,13 @@
   <header>
     <div>
       <h1>小型漆线雕工坊管理</h1>
-      <div class="sub">贴线、阴干、上金粉、待交付的作品流转与缺陷追踪</div>
+      <div class="sub">贴线、阴干、上金粉、待交付的作品流转与缺陷追踪 · 借展与外借归还台账</div>
     </div>
-    <button id="exportBtn" class="secondary">导出 JSON</button>
+    <div style="display: flex; gap: 8px;">
+      <button id="importBtn" class="secondary">导入恢复</button>
+      <button id="exportBtn" class="secondary">导出 JSON</button>
+      <input type="file" id="importFile" accept="application/json,.json" hidden>
+    </div>
   </header>
 
   <main>
@@ -118,6 +138,35 @@
         <div id="board" class="board"></div>
       </section>
     </section>
+
+    <section class="panel">
+      <h2>借展与外借归还台账</h2>
+      <div class="loan-grid">
+        <form id="loanForm">
+          <div class="grid2">
+            <label>借展单位<input name="borrower" required placeholder="市博物馆"></label>
+            <label>用途/展厅<input name="purpose" required placeholder="非遗特展"></label>
+          </div>
+          <div class="grid2">
+            <label>借出日期<input name="startDate" type="date" required></label>
+            <label>应还日期<input name="dueDate" type="date" required></label>
+          </div>
+          <div class="grid2">
+            <label>申请人<input name="applicant" required placeholder="发起借展"></label>
+            <label>审批人<input name="approver" required placeholder="批准/驳回"></label>
+          </div>
+          <div class="grid2">
+            <label>承运人<input name="carrier" required placeholder="出库/归还"></label>
+            <label>验收人<input name="inspector" required placeholder="归还验收"></label>
+          </div>
+          <label>借展作品（同一作品不可同时出现在两张未结束借展单）</label>
+          <div id="loanWorkList" class="work-picker"></div>
+          <div id="loanFormMsg" class="msg"></div>
+          <button type="submit">提交借展申请</button>
+        </form>
+        <div id="loanLedger"></div>
+      </div>
+    </section>
   </main>
 
   <dialog id="detailDialog">
@@ -134,17 +183,45 @@
     </div>
   </dialog>
 
+  <dialog id="loanDialog">
+    <div class="dialog-body">
+      <h2 id="loanTitle">借展单</h2>
+      <div id="loanInfo" class="meta"></div>
+      <div id="loanWorks"></div>
+      <div>
+        <h3>流转记录</h3>
+        <div id="loanHistory" class="hist"></div>
+      </div>
+      <div id="loanClaims"></div>
+      <div id="loanSupps"></div>
+      <div id="loanActions"></div>
+      <div id="loanMsg" class="msg"></div>
+      <div class="actions">
+        <button id="closeLoanDialog" class="secondary">关闭</button>
+      </div>
+    </div>
+  </dialog>
+
   <script>
     const statuses = ["贴线中", "待阴干", "上金粉", "待交付"];
     const storageKey = "zfl42Works";
+    const loanKey = "zfl42Loans";
     const today = new Date().toISOString().slice(0, 10);
+    const plusDays = n => new Date(Date.now() + n * 86400000).toISOString().slice(0, 10);
     const seed = [
       { id: crypto.randomUUID(), base: "木胎香盒", theme: "海水江崖", line: "细线", progress: 70, dryDate: today, gold: "未处理", defect: "", delivery: "2026-06-26", status: "待阴干", note: "边线需保持低浮雕感", logs: ["创建作品"] },
       { id: crypto.randomUUID(), base: "脱胎盘", theme: "折枝梅", line: "混合线", progress: 95, dryDate: "2026-06-20", gold: "试扫粉", defect: "左侧枝干翘线", delivery: "2026-06-23", status: "上金粉", note: "客户要求金粉偏暗", logs: ["创建作品", "记录翘线"] },
-      { id: crypto.randomUUID(), base: "竹胎笔筒", theme: "云雷纹", line: "中线", progress: 40, dryDate: "2026-06-24", gold: "未处理", defect: "", delivery: "2026-06-30", status: "贴线中", note: "", logs: ["创建作品"] }
+      { id: crypto.randomUUID(), base: "竹胎笔筒", theme: "云雷纹", line: "中线", progress: 40, dryDate: "2026-06-24", gold: "未处理", defect: "", delivery: "2026-06-30", status: "贴线中", note: "", logs: ["创建作品"] },
+      { id: crypto.randomUUID(), base: "漆线雕挂屏", theme: "松鹤延年", line: "混合线", progress: 100, dryDate: "2026-06-10", gold: "已上金粉", defect: "", delivery: "2026-06-18", status: "待交付", note: "展厅级成品", logs: ["创建作品"] },
+      { id: crypto.randomUUID(), base: "木胎花瓶", theme: "凤穿牡丹", line: "粗线", progress: 100, dryDate: "2026-06-12", gold: "已上金粉", defect: "", delivery: "2026-06-28", status: "待交付", note: "", logs: ["创建作品"] }
     ];
     let works = JSON.parse(localStorage.getItem(storageKey) || "null") || seed;
+    let loans = JSON.parse(localStorage.getItem(loanKey) || "null") || [];
     let activeId = null;
+    let activeLoanId = null;
+
+    const OPEN_LOAN = ["申请中", "已批准", "已出库", "归还待验"];
+    const TERMINAL_LOAN = ["已关闭", "已驳回", "已撤回"];
 
     const form = document.querySelector("#workForm");
     const board = document.querySelector("#board");
@@ -152,14 +229,234 @@
     const themeFilter = document.querySelector("#themeFilter");
     const sortMode = document.querySelector("#sortMode");
     const dialog = document.querySelector("#detailDialog");
+    const loanForm = document.querySelector("#loanForm");
+    const loanDialog = document.querySelector("#loanDialog");
 
     form.dryDate.value = today;
-    form.delivery.value = new Date(Date.now() + 5 * 86400000).toISOString().slice(0, 10);
+    form.delivery.value = plusDays(5);
+    loanForm.startDate.value = today;
+    loanForm.dueDate.value = plusDays(14);
     statusFilter.innerHTML = `<option value="">全部状态</option>` + statuses.map(s => `<option>${s}</option>`).join("");
 
     function save() {
       localStorage.setItem(storageKey, JSON.stringify(works));
     }
+
+    function saveLoans() {
+      localStorage.setItem(loanKey, JSON.stringify(loans));
+    }
+
+    function saveAll() {
+      save();
+      saveLoans();
+    }
+
+    function now() {
+      return new Date().toLocaleString();
+    }
+
+    function workById(id) {
+      return works.find(w => w.id === id);
+    }
+
+    function findLoan(id) {
+      return loans.find(l => l.id === id);
+    }
+
+    // 同一作品不能同时出现在两张未结束借展单
+    function openLoanOf(workId, excludeId) {
+      return loans.find(l => l.id !== excludeId && OPEN_LOAN.includes(l.status) && l.workIds.includes(workId)) || null;
+    }
+
+    function isOverdue(loan) {
+      return loan.status === "已出库" && loan.dueDate < today;
+    }
+
+    function pushHistory(loan, actor, action, reason) {
+      loan.history.push({ t: now(), actor, action, reason: reason || "" });
+    }
+
+    function workLog(w, text) {
+      w.logs = w.logs || [];
+      w.logs.push(text);
+    }
+
+    /* ---------- 借展状态机：所有动作返回错误字符串，null 表示成功；失败时零变更 ---------- */
+
+    function createLoan(data, workIds) {
+      const roles = [data.applicant, data.approver, data.carrier, data.inspector].map(s => (s || "").trim());
+      if (!(data.borrower || "").trim() || !(data.purpose || "").trim()) return "请填写借展单位与用途";
+      if (!workIds.length) return "请至少选择一件作品";
+      if (roles.some(r => !r)) return "请填写申请人、审批人、承运人、验收人";
+      if (new Set(roles).size !== 4) return "申请人、审批人、承运人、验收人须由不同人员担任";
+      if (!data.startDate || !data.dueDate) return "请填写借出日期与应还日期";
+      if (data.dueDate < data.startDate) return "应还日期不能早于借出日期";
+      for (const wid of workIds) {
+        const w = workById(wid);
+        if (!w) return "所选作品不存在";
+        const other = openLoanOf(wid);
+        if (other) return `作品《${w.theme}》已在未结束借展单 ${other.code} 中`;
+      }
+      const loan = {
+        id: crypto.randomUUID(),
+        code: "JC-" + String(loans.length + 1).padStart(3, "0"),
+        workIds: [...workIds],
+        borrower: data.borrower.trim(),
+        purpose: data.purpose.trim(),
+        startDate: data.startDate,
+        dueDate: data.dueDate,
+        applicant: roles[0],
+        approver: roles[1],
+        carrier: roles[2],
+        inspector: roles[3],
+        status: "申请中",
+        history: [],
+        claims: [],
+        supplements: []
+      };
+      pushHistory(loan, loan.applicant, "提交借展申请");
+      loans.unshift(loan);
+      saveLoans();
+      render();
+      return null;
+    }
+
+    function guard(loan, status, actor, roleKey, roleName) {
+      if (!loan) return "借展单不存在";
+      if (TERMINAL_LOAN.includes(loan.status)) return `借展单${loan.status}，原记录只读`;
+      if (loan.status !== status) return `当前状态为「${loan.status}」，无法执行此操作`;
+      if ((actor || "").trim() !== loan[roleKey]) return `此操作须由${roleName} ${loan[roleKey]} 本人执行`;
+      return null;
+    }
+
+    function approveLoan(id, actor) {
+      const loan = findLoan(id);
+      const err = guard(loan, "申请中", actor, "approver", "审批人");
+      if (err) return err;
+      for (const wid of loan.workIds) {
+        const other = openLoanOf(wid, loan.id);
+        if (other) return `作品《${workById(wid).theme}》已被借展单 ${other.code} 占用`;
+      }
+      loan.status = "已批准";
+      pushHistory(loan, actor.trim(), "批准借展");
+      saveLoans();
+      render();
+      return null;
+    }
+
+    function rejectLoan(id, actor, reason) {
+      const loan = findLoan(id);
+      const err = guard(loan, "申请中", actor, "approver", "审批人");
+      if (err) return err;
+      if (!(reason || "").trim()) return "驳回须填写原因";
+      loan.status = "已驳回";
+      pushHistory(loan, actor.trim(), "驳回申请", reason.trim());
+      saveLoans();
+      render();
+      return null;
+    }
+
+    function withdrawLoan(id, actor, reason) {
+      const loan = findLoan(id);
+      if (!loan) return "借展单不存在";
+      if (TERMINAL_LOAN.includes(loan.status)) return `借展单${loan.status}，原记录只读`;
+      if (!["申请中", "已批准"].includes(loan.status)) return `当前状态为「${loan.status}」，无法撤回`;
+      if ((actor || "").trim() !== loan.applicant) return `此操作须由申请人 ${loan.applicant} 本人执行`;
+      if (!(reason || "").trim()) return "撤回须填写原因";
+      loan.status = "已撤回";
+      pushHistory(loan, actor.trim(), "撤回申请", reason.trim());
+      saveLoans();
+      render();
+      return null;
+    }
+
+    // 出库：任一作品不符条件则整批不放行，不产生部分变更
+    function checkoutLoan(id, actor) {
+      const loan = findLoan(id);
+      const err = guard(loan, "已批准", actor, "carrier", "承运人");
+      if (err) return err;
+      const problems = [];
+      for (const wid of loan.workIds) {
+        const w = workById(wid);
+        if (!w) { problems.push("存在已被删除的作品"); continue; }
+        const other = openLoanOf(wid, loan.id);
+        if (other) problems.push(`《${w.theme}》已被借展单 ${other.code} 占用`);
+        if (w.status !== "待交付") problems.push(`《${w.theme}》当前状态为「${w.status}」，须为「待交付」方可出库`);
+        if (w.defect) problems.push(`《${w.theme}》存在未处理缺陷：${w.defect}`);
+      }
+      if (problems.length) return "整批未放行，未产生任何变更：\n" + problems.join("\n");
+      loan.status = "已出库";
+      pushHistory(loan, actor.trim(), "整批出库");
+      loan.workIds.forEach(wid => workLog(workById(wid), `${now()} 借展出库（${loan.code}）`));
+      saveAll();
+      render();
+      return null;
+    }
+
+    // 归还：须整批确认到齐；逾期须留原因；任一不符则整批不放行
+    function returnLoan(id, actor, checkedIds, overdueReason) {
+      const loan = findLoan(id);
+      const err = guard(loan, "已出库", actor, "carrier", "承运人");
+      if (err) return err;
+      const missing = loan.workIds.filter(wid => !checkedIds.includes(wid));
+      if (missing.length) {
+        return "整批未放行，未产生任何变更：以下作品未确认归还：" +
+          missing.map(wid => `《${(workById(wid) || {}).theme || wid}》`).join("、");
+      }
+      if (isOverdue(loan) && !(overdueReason || "").trim()) return "该单已逾期，须填写逾期原因方可登记归还";
+      const wasOverdue = isOverdue(loan);
+      loan.status = "归还待验";
+      pushHistory(loan, actor.trim(), "整批归还，待验收", wasOverdue ? "逾期原因：" + overdueReason.trim() : "");
+      loan.workIds.forEach(wid => workLog(workById(wid), `${now()} 借展归还（${loan.code}）`));
+      saveAll();
+      render();
+      return null;
+    }
+
+    // 验收关闭：损坏作品须留理赔原因，否则整批不验收
+    function closeLoan(id, actor, results) {
+      const loan = findLoan(id);
+      const err = guard(loan, "归还待验", actor, "inspector", "验收人");
+      if (err) return err;
+      const problems = [];
+      for (const wid of loan.workIds) {
+        const r = results[wid] || {};
+        if (r.damaged && !(r.claim || "").trim()) {
+          problems.push(`《${(workById(wid) || {}).theme || wid}》验收为损坏，须填写损坏理赔原因`);
+        }
+      }
+      if (problems.length) return "整批未验收，未产生任何变更：\n" + problems.join("\n");
+      loan.status = "已关闭";
+      for (const wid of loan.workIds) {
+        const r = results[wid] || {};
+        if (!r.damaged) continue;
+        const w = workById(wid);
+        const text = r.claim.trim();
+        loan.claims.push({ workId: wid, theme: w ? w.theme : wid, text, t: now() });
+        if (w) {
+          w.defect = w.defect ? `${w.defect}; 借展损坏：${text}` : `借展损坏：${text}`;
+          workLog(w, `${now()} 借展验收损坏（${loan.code}）：${text}`);
+        }
+      }
+      pushHistory(loan, actor.trim(), "验收通过，借展单关闭", loan.claims.length ? `损坏理赔 ${loan.claims.length} 件` : "");
+      saveAll();
+      render();
+      return null;
+    }
+
+    // 关闭后原记录只读，补充说明以追加记录呈现
+    function addSupplement(id, author, text) {
+      const loan = findLoan(id);
+      if (!loan) return "借展单不存在";
+      if (loan.status !== "已关闭") return "仅已关闭的借展单可追加补充说明";
+      if (!(author || "").trim() || !(text || "").trim()) return "请填写说明人与补充内容";
+      loan.supplements.push({ t: now(), author: author.trim(), text: text.trim() });
+      saveLoans();
+      render();
+      return null;
+    }
+
+    /* ---------- 作品看板 ---------- */
 
     function filtered() {
       return works
@@ -174,7 +471,7 @@
       if (status === "待阴干") work.dryDate = new Date().toISOString().slice(0, 10);
       if (status === "上金粉") work.gold = "已上金粉";
       if (status === "待交付") work.progress = 100;
-      work.logs.push(`${new Date().toLocaleString()} 更新为 ${status}`);
+      workLog(work, `${now()} 更新为 ${status}`);
       save();
       render();
     }
@@ -184,7 +481,7 @@
       const value = text || prompt("输入断线/翘线位置");
       if (!value) return;
       work.defect = work.defect ? `${work.defect}; ${value}` : value;
-      work.logs.push(`${new Date().toLocaleString()} 缺陷：${value}`);
+      workLog(work, `${now()} 缺陷：${value}`);
       save();
       render();
     }
@@ -192,12 +489,15 @@
     function showDetail(id) {
       activeId = id;
       const w = works.find(item => item.id === id);
+      const loan = openLoanOf(id);
       document.querySelector("#detailTitle").textContent = `${w.theme} · ${w.base}`;
       document.querySelector("#detailContent").innerHTML = `
         胎体材质：${w.base}<br>线条粗细：${w.line}<br>贴线进度：${w.progress}%<br>
         阴干日期：${w.dryDate}<br>金粉状态：${w.gold}<br>缺陷位置：${w.defect || "无"}<br>
-        交付日期：${w.delivery}<br>当前状态：${w.status}<br>备注：${w.note || "无"}<br>
-        流转记录：${w.logs.join(" / ")}
+        交付日期：${w.delivery}<br>当前状态：${w.status}<br>
+        借展：${loan ? `${loan.code}（${loan.status}）` : "无"}<br>
+        备注：${w.note || "无"}<br>
+        流转记录：${(w.logs || []).join(" / ")}
       `;
       document.querySelector("#defectInput").value = "";
       dialog.showModal();
@@ -214,13 +514,15 @@
 
     function renderBoard() {
       const list = filtered();
+      const loanByWork = {};
+      loans.filter(l => OPEN_LOAN.includes(l.status)).forEach(l => l.workIds.forEach(wid => { loanByWork[wid] = l; }));
       board.innerHTML = statuses.map(status => {
         const cards = list.filter(w => w.status === status);
         return `<section class="col">
           <h3><span>${status}</span><span>${cards.length}</span></h3>
           ${cards.length ? cards.map(w => `<article class="item ${w.defect ? "overdue" : ""}" onclick="showDetail('${w.id}')">
             <b>${w.theme}</b>
-            <div class="meta">${w.base} · ${w.line}<br>进度 ${w.progress}% · 阴干 ${w.dryDate}<br>金粉：${w.gold} · 交付：${w.delivery}<br>${w.defect ? "缺陷：" + w.defect : "缺陷：无"}</div>
+            <div class="meta">${w.base} · ${w.line}<br>进度 ${w.progress}% · 阴干 ${w.dryDate}<br>金粉：${w.gold} · 交付：${w.delivery}<br>${w.defect ? "缺陷：" + w.defect : "缺陷：无"}${loanByWork[w.id] ? `<br>借展：${loanByWork[w.id].code}（${loanByWork[w.id].status}）` : ""}</div>
             <div class="actions" onclick="event.stopPropagation()">
               ${statuses.map(s => `<button class="${s === status ? "secondary" : ""}" onclick="updateStatus('${w.id}', '${s}')">${s}</button>`).join("")}
               <button class="warn" onclick="recordDefect('${w.id}')">记缺陷</button>
@@ -230,10 +532,143 @@
       }).join("");
     }
 
+    /* ---------- 借展台账 UI ---------- */
+
+    function chipClass(s) {
+      return { "申请中": "s-open", "已批准": "s-open", "已出库": "s-out", "归还待验": "s-back", "已关闭": "s-done", "已驳回": "s-stop", "已撤回": "s-stop" }[s];
+    }
+
+    function renderLoanPicker() {
+      const box = document.querySelector("#loanWorkList");
+      box.innerHTML = works.length ? works.map(w => {
+        const busy = openLoanOf(w.id);
+        return `<label class="${busy ? "busy" : ""}">
+          <input type="checkbox" name="loanWorks" value="${w.id}" ${busy ? "disabled" : ""}>
+          <span>${w.theme} · ${w.base}（${w.status}${w.defect ? " · 有缺陷" : ""}）${busy ? ` — 借展中 ${busy.code}` : ""}</span>
+        </label>`;
+      }).join("") : `<div class="empty">暂无作品</div>`;
+    }
+
+    function renderLedger() {
+      const el = document.querySelector("#loanLedger");
+      el.innerHTML = loans.length ? loans.map(l => `
+        <div class="item" onclick="showLoan('${l.id}')">
+          <b>${l.code} · ${l.borrower}</b>
+          <span class="chip ${chipClass(l.status)}">${l.status}</span>
+          ${isOverdue(l) ? `<span class="chip s-stop">逾期</span>` : ""}
+          <div class="meta">${l.workIds.length} 件作品 · 应还 ${l.dueDate} · 申请人 ${l.applicant} · 审批人 ${l.approver} · 承运人 ${l.carrier} · 验收人 ${l.inspector}</div>
+        </div>`).join("") : `<div class="empty">暂无借展单</div>`;
+    }
+
+    function showLoan(id) {
+      activeLoanId = id;
+      const loan = findLoan(id);
+      if (!loan) return;
+      document.querySelector("#loanTitle").textContent = `${loan.code} · ${loan.borrower}`;
+      document.querySelector("#loanInfo").innerHTML = `
+        状态：<span class="chip ${chipClass(loan.status)}">${loan.status}</span>${isOverdue(loan) ? ` <span class="chip s-stop">逾期</span>` : ""}<br>
+        借展单位：${loan.borrower} · 用途：${loan.purpose}<br>
+        借出日期：${loan.startDate} · 应还日期：${loan.dueDate}<br>
+        申请人：${loan.applicant} · 审批人：${loan.approver} · 承运人：${loan.carrier} · 验收人：${loan.inspector}`;
+      document.querySelector("#loanWorks").innerHTML = `<h3>借展作品（${loan.workIds.length}）</h3>` + loan.workIds.map(wid => {
+        const w = workById(wid);
+        return `<div class="meta">${w ? `《${w.theme}》 ${w.base} · ${w.status}${w.defect ? " · 缺陷：" + w.defect : ""}` : `作品已删除（${wid}）`}</div>`;
+      }).join("");
+      document.querySelector("#loanHistory").innerHTML = loan.history.map(h => `<div>${h.t} ｜ ${h.actor} ｜ ${h.action}${h.reason ? " ｜ " + h.reason : ""}</div>`).join("");
+      document.querySelector("#loanClaims").innerHTML = loan.claims.length
+        ? `<h3>损坏理赔</h3>` + loan.claims.map(c => `<div class="hist">${c.t} ｜ 《${c.theme}》 ｜ ${c.text}</div>`).join("")
+        : "";
+      document.querySelector("#loanSupps").innerHTML = loan.supplements.length
+        ? `<h3>补充说明（追加记录）</h3>` + loan.supplements.map(s => `<div class="hist">${s.t} ｜ ${s.author} ｜ ${s.text}</div>`).join("")
+        : "";
+      renderLoanActions(loan);
+      document.querySelector("#loanMsg").textContent = "";
+      if (!loanDialog.open) loanDialog.showModal();
+    }
+
+    function renderLoanActions(loan) {
+      const box = document.querySelector("#loanActions");
+      const actorInput = `<label>操作人<input id="loanActor" placeholder="须与对应职责人一致"></label>`;
+      const reasonInput = ph => `<label>原因<input id="loanReason" placeholder="${ph}"></label>`;
+      const readonly = `<div class="empty">借展单${loan.status}，原记录只读。</div>`;
+      let html = "";
+      if (loan.status === "申请中") {
+        html = `${actorInput}${reasonInput("驳回/撤回时必填原因")}
+          <div class="actions">
+            <button id="approveBtn">批准</button>
+            <button id="rejectBtn" class="danger">驳回</button>
+            <button id="withdrawBtn" class="warn">撤回</button>
+          </div>`;
+      } else if (loan.status === "已批准") {
+        html = `${actorInput}${reasonInput("撤回时必填原因")}
+          <div class="actions">
+            <button id="checkoutBtn" class="violet">整批出库</button>
+            <button id="withdrawBtn" class="warn">撤回</button>
+          </div>`;
+      } else if (loan.status === "已出库") {
+        html = `${actorInput}
+          <div class="retChecks">${loan.workIds.map(wid => {
+            const w = workById(wid);
+            return `<label><input type="checkbox" class="returnCheck" value="${wid}"> 确认《${w ? w.theme : wid}》已归还</label>`;
+          }).join("")}</div>
+          ${reasonInput(isOverdue(loan) ? "该单已逾期，必填逾期原因" : "逾期时必填原因")}
+          <div class="actions"><button id="returnBtn" class="violet">整批归还</button></div>`;
+      } else if (loan.status === "归还待验") {
+        html = `${actorInput}
+          ${loan.workIds.map(wid => {
+            const w = workById(wid);
+            return `<div class="inspect-row"><span>《${w ? w.theme : wid}》</span><select class="inspectSel" data-wid="${wid}"><option value="ok">完好</option><option value="damaged">损坏</option></select><input class="claimInput" data-wid="${wid}" placeholder="损坏理赔原因"></div>`;
+          }).join("")}
+          <div class="actions"><button id="closeLoanBtn">验收并关闭</button></div>`;
+      } else if (loan.status === "已关闭") {
+        html = `${readonly}
+          <label>说明人<input id="suppAuthor" placeholder="姓名"></label>
+          <label>补充说明<textarea id="suppText" placeholder="以追加记录呈现，不改动原记录"></textarea></label>
+          <div class="actions"><button id="suppBtn" class="secondary">追加补充说明</button></div>`;
+      } else {
+        html = readonly;
+      }
+      box.innerHTML = html;
+
+      const q = s => box.querySelector(s);
+      const actor = () => (q("#loanActor") || { value: "" }).value;
+      const reason = () => (q("#loanReason") || { value: "" }).value;
+      const run = fn => {
+        const err = fn();
+        if (err) {
+          document.querySelector("#loanMsg").textContent = err;
+        } else {
+          showLoan(loan.id);
+        }
+      };
+      if (q("#approveBtn")) q("#approveBtn").addEventListener("click", () => run(() => approveLoan(loan.id, actor())));
+      if (q("#rejectBtn")) q("#rejectBtn").addEventListener("click", () => run(() => rejectLoan(loan.id, actor(), reason())));
+      if (q("#withdrawBtn")) q("#withdrawBtn").addEventListener("click", () => run(() => withdrawLoan(loan.id, actor(), reason())));
+      if (q("#checkoutBtn")) q("#checkoutBtn").addEventListener("click", () => run(() => checkoutLoan(loan.id, actor())));
+      if (q("#returnBtn")) q("#returnBtn").addEventListener("click", () => run(() => {
+        const checked = [...box.querySelectorAll(".returnCheck:checked")].map(c => c.value);
+        return returnLoan(loan.id, actor(), checked, reason());
+      }));
+      if (q("#closeLoanBtn")) q("#closeLoanBtn").addEventListener("click", () => run(() => {
+        const results = {};
+        box.querySelectorAll(".inspectSel").forEach(sel => {
+          const wid = sel.dataset.wid;
+          const claim = box.querySelector(`.claimInput[data-wid="${wid}"]`);
+          results[wid] = { damaged: sel.value === "damaged", claim: claim ? claim.value : "" };
+        });
+        return closeLoan(loan.id, actor(), results);
+      }));
+      if (q("#suppBtn")) q("#suppBtn").addEventListener("click", () => run(() => addSupplement(loan.id, q("#suppAuthor").value, q("#suppText").value)));
+    }
+
     function render() {
       renderSummaries();
       renderBoard();
+      renderLoanPicker();
+      renderLedger();
     }
+
+    /* ---------- 事件 ---------- */
 
     form.addEventListener("submit", event => {
       event.preventDefault();
@@ -250,13 +685,25 @@
         delivery: data.delivery,
         status: data.status,
         note: data.note,
-        logs: [`${new Date().toLocaleString()} 创建作品`]
+        logs: [`${now()} 创建作品`]
       });
       form.reset();
       form.dryDate.value = today;
-      form.delivery.value = new Date(Date.now() + 5 * 86400000).toISOString().slice(0, 10);
+      form.delivery.value = plusDays(5);
       save();
       render();
+    });
+
+    loanForm.addEventListener("submit", event => {
+      event.preventDefault();
+      const data = Object.fromEntries(new FormData(loanForm).entries());
+      const ids = [...loanForm.querySelectorAll('input[name="loanWorks"]:checked')].map(c => c.value);
+      const err = createLoan(data, ids);
+      document.querySelector("#loanFormMsg").textContent = err || "";
+      if (err) return;
+      loanForm.reset();
+      loanForm.startDate.value = today;
+      loanForm.dueDate.value = plusDays(14);
     });
 
     document.querySelector("#saveDefect").addEventListener("click", () => {
@@ -264,25 +711,57 @@
       showDetail(activeId);
     });
     document.querySelector("#closeDialog").addEventListener("click", () => dialog.close());
+    document.querySelector("#closeLoanDialog").addEventListener("click", () => loanDialog.close());
     document.querySelector("#clearFilters").addEventListener("click", () => {
       themeFilter.value = "";
       statusFilter.value = "";
       render();
     });
     [statusFilter, themeFilter, sortMode].forEach(el => el.addEventListener("input", render));
+
     document.querySelector("#exportBtn").addEventListener("click", () => {
-      const blob = new Blob([JSON.stringify(works, null, 2)], { type: "application/json" });
+      const payload = { works, loans, exportedAt: new Date().toISOString() };
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
       const link = document.createElement("a");
       link.href = URL.createObjectURL(blob);
-      link.download = "lacquer-thread-works.json";
+      link.download = "lacquer-thread-backup.json";
       link.click();
       URL.revokeObjectURL(link.href);
+    });
+
+    document.querySelector("#importBtn").addEventListener("click", () => document.querySelector("#importFile").click());
+    document.querySelector("#importFile").addEventListener("change", async event => {
+      const file = event.target.files[0];
+      if (!file) return;
+      try {
+        const parsed = JSON.parse(await file.text());
+        const importedWorks = Array.isArray(parsed) ? parsed : parsed.works;
+        const importedLoans = Array.isArray(parsed) ? [] : (parsed.loans || []);
+        if (!Array.isArray(importedWorks)) throw new Error("bad format");
+        works = importedWorks;
+        loans = importedLoans;
+        saveAll();
+        render();
+        alert(`恢复完成：作品 ${works.length} 件，借展单 ${loans.length} 张`);
+      } catch (err) {
+        alert("导入失败：文件格式不正确");
+      }
+      event.target.value = "";
     });
 
     window.updateStatus = updateStatus;
     window.recordDefect = recordDefect;
     window.showDetail = showDetail;
-    save();
+    window.showLoan = showLoan;
+    window.createLoan = createLoan;
+    window.approveLoan = approveLoan;
+    window.rejectLoan = rejectLoan;
+    window.withdrawLoan = withdrawLoan;
+    window.checkoutLoan = checkoutLoan;
+    window.returnLoan = returnLoan;
+    window.closeLoan = closeLoan;
+    window.addSupplement = addSupplement;
+    saveAll();
     render();
   </script>
 </body>
